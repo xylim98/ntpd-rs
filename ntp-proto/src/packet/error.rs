@@ -29,6 +29,20 @@ impl<T> ParsingError<T> {
             V5(e) => Err(V5(e)),
         }
     }
+
+    pub fn with_version(self, version: u8) -> VersionedParsingError<T> {
+        VersionedParsingError {
+            error: self,
+            version: Some(version),
+        }
+    }
+
+    pub fn without_version(self) -> VersionedParsingError<T> {
+        VersionedParsingError {
+            error: self,
+            version: None,
+        }
+    }
 }
 
 impl ParsingError<std::convert::Infallible> {
@@ -45,6 +59,10 @@ impl ParsingError<std::convert::Infallible> {
             #[cfg(feature = "ntpv5")]
             V5(e) => V5(e),
         }
+    }
+
+    pub(super) fn generalize_versioned<U>(self, version: u8) -> VersionedParsingError<U> {
+        self.generalize().with_version(version)
     }
 }
 
@@ -66,3 +84,46 @@ impl<T> Display for ParsingError<T> {
 }
 
 impl<T: std::fmt::Debug> std::error::Error for ParsingError<T> {}
+
+#[derive(Debug)]
+pub struct VersionedParsingError<T> {
+    pub error: ParsingError<T>,
+    pub version: Option<u8>,
+}
+
+pub type VersionedPacketParsingError<'a> = VersionedParsingError<NtpPacket<'a>>;
+
+impl<T> From<ParsingError<T>> for VersionedParsingError<T> {
+    fn from(value: ParsingError<T>) -> Self {
+        value.without_version()
+    }
+}
+
+impl<T> Display for VersionedParsingError<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+pub trait ParsingResultExt<T, E> {
+    fn with_version(self, version: u8) -> Result<T, VersionedParsingError<E>>;
+    fn without_version(self) -> Result<T, VersionedParsingError<E>>;
+}
+
+impl<T, E> ParsingResultExt<T, E> for Result<T, ParsingError<E>> {
+    fn with_version(self, version: u8) -> Result<T, VersionedParsingError<E>> {
+        match self {
+            Ok(res) => Ok(res),
+            Err(e) => Err(e.with_version(version)),
+        }
+    }
+
+    fn without_version(self) -> Result<T, VersionedParsingError<E>> {
+        match self {
+            Ok(res) => Ok(res),
+            Err(e) => Err(e.without_version()),
+        }
+    }
+}
+
+impl<T: std::fmt::Debug> std::error::Error for VersionedParsingError<T> {}

@@ -1,4 +1,4 @@
-use super::server::ServerStats;
+use super::server::ServerVersionStats;
 use super::sockets::create_unix_socket_with_permissions;
 use super::spawn::PeerId;
 use super::system::ServerData;
@@ -49,7 +49,7 @@ impl Default for ProgramData {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ObservableServerState {
     pub address: SocketAddr,
-    pub stats: ServerStats,
+    pub stats: ServerVersionStats,
 }
 
 impl From<&ServerData> for ObservableServerState {

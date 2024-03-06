@@ -4,7 +4,7 @@ use super::{
     config::{ClockConfig, NormalizedAddress, PeerConfig, ServerConfig, TimestampMode},
     peer::{MsgForSystem, PeerChannels},
     peer::{PeerTask, Wait},
-    server::{ServerStats, ServerTask},
+    server::{ServerTask, ServerVersionStats},
     spawn::{
         nts::NtsSpawner, pool::PoolSpawner, standard::StandardSpawner, PeerCreateParameters,
         PeerId, PeerRemovalReason, SpawnAction, SpawnEvent, Spawner, SpawnerId, SystemEvent,
@@ -587,7 +587,7 @@ impl<C: NtpClock + Sync, T: Wait> System<C, T> {
     }
 
     async fn add_server(&mut self, config: ServerConfig) {
-        let stats = ServerStats::default();
+        let stats = ServerVersionStats::default();
         self.servers.push(ServerData {
             stats: stats.clone(),
             config: config.clone(),
@@ -639,7 +639,7 @@ struct PeerState {
 
 #[derive(Debug, Clone)]
 pub struct ServerData {
-    pub stats: ServerStats,
+    pub stats: ServerVersionStats,
     pub config: ServerConfig,
 }
 

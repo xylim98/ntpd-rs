@@ -11,7 +11,7 @@ use crate::{
     time_types::{NtpDuration, NtpTimestamp, PollInterval},
 };
 
-use self::{error::ParsingError, extension_fields::ExtensionFieldData, mac::Mac};
+use self::{error::{ParsingError, ParsingResultExt, VersionedPacketParsingError}, extension_fields::ExtensionFieldData, mac::Mac};
 
 mod crypto;
 mod error;
@@ -296,9 +296,9 @@ impl<'a> NtpPacket<'a> {
     pub fn deserialize(
         data: &'a [u8],
         cipher: &impl CipherProvider,
-    ) -> Result<(Self, Option<DecodedServerCookie>), PacketParsingError<'a>> {
+    ) -> Result<(Self, Option<DecodedServerCookie>), VersionedPacketParsingError<'a>,> {
         if data.is_empty() {
-            return Err(PacketParsingError::IncorrectLength);
+            return Err(PacketParsingError::IncorrectLength).without_version();
         }
 
         let version = (data[0] & 0b0011_1000) >> 3;
@@ -306,9 +306,9 @@ impl<'a> NtpPacket<'a> {
         match version {
             3 => {
                 let (header, header_size) =
-                    NtpHeaderV3V4::deserialize(data).map_err(|e| e.generalize())?;
+                    NtpHeaderV3V4::deserialize(data).map_err(|e| e.generalize_versioned(3))?;
                 let mac = if header_size != data.len() {
-                    Some(Mac::deserialize(&data[header_size..]).map_err(|e| e.generalize())?)
+                    Some(Mac::deserialize(&data[header_size..]).map_err(|e| e.generalize_versioned(3))?)
                 } else {
                     None
                 };
@@ -323,7 +323,7 @@ impl<'a> NtpPacket<'a> {
             }
             4 => {
                 let (header, header_size) =
-                    NtpHeaderV3V4::deserialize(data).map_err(|e| e.generalize())?;
+                    NtpHeaderV3V4::deserialize(data).map_err(|e| e.generalize_versioned(4))?;
 
                 let construct_packet = |remaining_bytes: &'a [u8], efdata| {
                     let mac = if !remaining_bytes.is_empty() {
@@ -349,7 +349,7 @@ impl<'a> NtpPacket<'a> {
                 ) {
                     Ok(decoded) => {
                         let packet = construct_packet(decoded.remaining_bytes, decoded.efdata)
-                            .map_err(|e| e.generalize())?;
+                            .map_err(|e| e.generalize_versioned(4))?;
 
                         Ok((packet, decoded.cookie))
                     }
@@ -358,16 +358,16 @@ impl<'a> NtpPacket<'a> {
                         let invalid = e.get_decrypt_error()?;
 
                         let packet = construct_packet(invalid.remaining_bytes, invalid.efdata)
-                            .map_err(|e| e.generalize())?;
+                            .map_err(|e| e.generalize_versioned(4))?;
 
-                        Err(ParsingError::DecryptError(packet))
+                        Err(ParsingError::DecryptError(packet)).with_version(4)
                     }
                 }
             }
             #[cfg(feature = "ntpv5")]
             5 => {
                 let (header, header_size) =
-                    v5::NtpHeaderV5::deserialize(data).map_err(|e| e.generalize())?;
+                    v5::NtpHeaderV5::deserialize(data).map_err(|e| e.generalize_versioned(5))?;
 
                 let construct_packet = |remaining_bytes: &'a [u8], efdata| {
                     let mac = if !remaining_bytes.is_empty() {
@@ -394,7 +394,7 @@ impl<'a> NtpPacket<'a> {
                 ) {
                     Ok(decoded) => {
                         let packet = construct_packet(decoded.remaining_bytes, decoded.efdata)
-                            .map_err(|e| e.generalize())?;
+                            .map_err(|e| e.generalize_versioned(5))?;
 
                         Ok((packet, decoded.cookie))
                     }
@@ -403,9 +403,9 @@ impl<'a> NtpPacket<'a> {
                         let invalid = e.get_decrypt_error()?;
 
                         let packet = construct_packet(invalid.remaining_bytes, invalid.efdata)
-                            .map_err(|e| e.generalize())?;
+                            .map_err(|e| e.generalize_versioned(5))?;
 
-                        Err(ParsingError::DecryptError(packet))
+                        Err(ParsingError::DecryptError(packet)).with_version(5)
                     }
                 };
 
@@ -419,11 +419,11 @@ impl<'a> NtpPacket<'a> {
                             received,
                             "Mismatched draft ID ignoring packet!"
                         );
-                        Err(ParsingError::V5(v5::V5Error::InvalidDraftIdentification))
+                        Err(ParsingError::V5(v5::V5Error::InvalidDraftIdentification)).with_version(5)
                     }
                 }
             }
-            _ => Err(PacketParsingError::InvalidVersion(version)),
+            _ => Err(PacketParsingError::InvalidVersion(version)).without_version(),
         }
     }
 
@@ -623,7 +623,7 @@ impl<'a> NtpPacket<'a> {
     #[cfg_attr(not(feature = "ntpv5"), allow(unused_mut))]
     pub fn timestamp_response<C: NtpClock>(
         system: &SystemSnapshot,
-        input: Self,
+        input: &Self,
         recv_timestamp: NtpTimestamp,
         clock: &C,
     ) -> Self {
@@ -666,10 +666,11 @@ impl<'a> NtpPacket<'a> {
                         untrusted: input
                             .efdata
                             .untrusted
-                            .into_iter()
-                            .chain(input.efdata.authenticated)
+                            .iter()
+                            .chain(input.efdata.authenticated.iter())
                             .filter(|ef| matches!(ef, ExtensionField::UniqueIdentifier(_)))
                             .chain(extra_ef)
+                            .cloned()
                             .collect(),
                     },
                     mac: None,
@@ -725,7 +726,7 @@ impl<'a> NtpPacket<'a> {
 
     pub fn nts_timestamp_response<C: NtpClock>(
         system: &SystemSnapshot,
-        input: Self,
+        input: &Self,
         recv_timestamp: NtpTimestamp,
         clock: &C,
         cookie: &DecodedServerCookie,
@@ -769,10 +770,11 @@ impl<'a> NtpPacket<'a> {
                     authenticated: input
                         .efdata
                         .authenticated
-                        .into_iter()
+                        .iter()
                         .filter(|ef| matches!(ef, ExtensionField::UniqueIdentifier(_)))
+                        .cloned()
                         .collect(),
-                    // Ignore encrypted so as not to accidentaly leak anything
+                    // Ignore untrusted so as not to accidentaly leak anything
                     untrusted: vec![],
                 },
                 mac: None,
@@ -814,7 +816,7 @@ impl<'a> NtpPacket<'a> {
                     authenticated: input
                         .efdata
                         .authenticated
-                        .into_iter()
+                        .iter()
                         .filter_map(|ef| match ef {
                             uid @ ExtensionField::UniqueIdentifier(_) => Some(uid),
                             ExtensionField::ReferenceIdRequest(req) => {
@@ -834,7 +836,7 @@ impl<'a> NtpPacket<'a> {
         }
     }
 
-    pub fn rate_limit_response(packet_from_client: Self) -> Self {
+    pub fn rate_limit_response(packet_from_client: &Self) -> Self {
         match packet_from_client.header {
             NtpHeader::V3(header) => NtpPacket {
                 header: NtpHeader::V3(NtpHeaderV3V4::rate_limit_response(header)),
@@ -850,9 +852,10 @@ impl<'a> NtpPacket<'a> {
                     untrusted: packet_from_client
                         .efdata
                         .untrusted
-                        .into_iter()
-                        .chain(packet_from_client.efdata.authenticated)
+                        .iter()
+                        .chain(packet_from_client.efdata.authenticated.iter())
                         .filter(|ef| matches!(ef, ExtensionField::UniqueIdentifier(_)))
+                        .cloned()
                         .collect(),
                 },
                 mac: None,
@@ -880,7 +883,7 @@ impl<'a> NtpPacket<'a> {
         }
     }
 
-    pub fn nts_rate_limit_response(packet_from_client: Self) -> Self {
+    pub fn nts_rate_limit_response(packet_from_client: &Self) -> Self {
         match packet_from_client.header {
             NtpHeader::V3(_) => unreachable!("NTS shouldn't work with NTPv3"),
             NtpHeader::V4(header) => NtpPacket {
@@ -889,8 +892,9 @@ impl<'a> NtpPacket<'a> {
                     authenticated: packet_from_client
                         .efdata
                         .authenticated
-                        .into_iter()
+                        .iter()
                         .filter(|ef| matches!(ef, ExtensionField::UniqueIdentifier(_)))
+                        .cloned()
                         .collect(),
                     encrypted: vec![],
                     untrusted: vec![],
@@ -904,11 +908,12 @@ impl<'a> NtpPacket<'a> {
                     authenticated: packet_from_client
                         .efdata
                         .authenticated
-                        .into_iter()
+                        .iter()
                         .filter(|ef| matches!(ef, ExtensionField::UniqueIdentifier(_)))
                         .chain(std::iter::once(ExtensionField::DraftIdentification(
                             Cow::Borrowed(v5::DRAFT_VERSION),
                         )))
+                        .cloned()
                         .collect(),
                     encrypted: vec![],
                     untrusted: vec![],
@@ -918,7 +923,7 @@ impl<'a> NtpPacket<'a> {
         }
     }
 
-    pub fn deny_response(packet_from_client: Self) -> Self {
+    pub fn deny_response(packet_from_client: &Self) -> Self {
         match packet_from_client.header {
             NtpHeader::V3(header) => NtpPacket {
                 header: NtpHeader::V3(NtpHeaderV3V4::deny_response(header)),
@@ -934,9 +939,10 @@ impl<'a> NtpPacket<'a> {
                     untrusted: packet_from_client
                         .efdata
                         .untrusted
-                        .into_iter()
-                        .chain(packet_from_client.efdata.authenticated)
+                        .iter()
+                        .chain(packet_from_client.efdata.authenticated.iter())
                         .filter(|ef| matches!(ef, ExtensionField::UniqueIdentifier(_)))
+                        .cloned()
                         .collect(),
                 },
                 mac: None,
@@ -964,7 +970,7 @@ impl<'a> NtpPacket<'a> {
         }
     }
 
-    pub fn nts_deny_response(packet_from_client: Self) -> Self {
+    pub fn nts_deny_response(packet_from_client: &Self) -> Self {
         match packet_from_client.header {
             NtpHeader::V3(_) => unreachable!("NTS shouldn't work with NTPv3"),
             NtpHeader::V4(header) => NtpPacket {

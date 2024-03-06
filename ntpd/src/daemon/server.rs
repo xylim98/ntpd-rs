@@ -30,6 +30,7 @@ const MAX_PACKET_SIZE: usize = 1024;
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct ServerStats {
     pub received_packets: Counter,
+    pub invalid_packets: Counter,
     pub accepted_packets: Counter,
     pub denied_packets: Counter,
     pub ignored_packets: Counter,
@@ -42,15 +43,53 @@ pub struct ServerStats {
     pub nts_nak_packets: Counter,
 }
 
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+pub struct ServerVersionStats {
+    pub total: ServerStats,
+    pub unknown: ServerStats,
+    pub v3: ServerStats,
+    pub v4: ServerStats,
+    #[cfg(feature = "unstable_ntpv5")]
+    pub v5: ServerStats,
+}
+
+impl ServerVersionStats {
+    fn register(&self, accept_result: &AcceptResult<'_>) {
+        self.total.register(accept_result);
+
+        // version 0 is used as a placeholder for unknown protocol versions
+        let version = accept_result.get_packet_version().unwrap_or(0);
+        match version {
+            3 => self.v3.register(accept_result),
+            4 => self.v4.register(accept_result),
+            #[cfg(feature = "unstable_ntpv5")]
+            5 => self.v5.register(accept_result),
+            _ => self.unknown.register(accept_result),
+        }
+    }
+
+    fn register_send_error(&self, accept_result: &AcceptResult<'_>) {
+        self.total.response_send_errors.inc();
+        let version = accept_result.get_packet_version().unwrap_or(0);
+        match version {
+            3 => self.v3.response_send_errors.inc(),
+            4 => self.v4.response_send_errors.inc(),
+            #[cfg(feature = "unstable_ntpv5")]
+            5 => self.v5.response_send_errors.inc(),
+            _ => self.unknown.response_send_errors.inc(),
+        }
+    }
+}
+
 impl ServerStats {
-    fn update_from(&self, accept_result: &AcceptResult<'_>) {
-        use AcceptResult::{Accept, CryptoNak, Deny, Ignore, RateLimit};
+    fn register(&self, accept_result: &AcceptResult<'_>) {
+        use AcceptResult::*;
 
         self.received_packets.inc();
-
         match accept_result {
+            Invalid { .. } => self.invalid_packets.inc(),
             Accept { .. } => self.accepted_packets.inc(),
-            Ignore => self.ignored_packets.inc(),
+            Ignore { .. } => self.ignored_packets.inc(),
             Deny { .. } => self.denied_packets.inc(),
             RateLimit { .. } => self.rate_limited_packets.inc(),
             CryptoNak { .. } => self.nts_nak_packets.inc(),
@@ -62,7 +101,7 @@ impl ServerStats {
                 Accept { .. } => self.nts_accepted_packets.inc(),
                 Deny { .. } => self.nts_denied_packets.inc(),
                 RateLimit { .. } => self.nts_rate_limited_packets.inc(),
-                CryptoNak { .. } | Ignore => { /* counted above */ }
+                CryptoNak { .. } | Ignore { .. } | Invalid { .. } => { /* counted above */ }
             };
         }
     }
@@ -110,17 +149,22 @@ pub struct ServerTask<C: 'static + NtpClock + Send> {
     system: SystemSnapshot,
     client_cache: TimestampedCache<IpAddr>,
     clock: C,
-    stats: ServerStats,
+    stats: ServerVersionStats,
 }
 
 #[derive(Debug)]
 enum AcceptResult<'a> {
+    Invalid {
+        packet_version: Option<u8>,
+    },
     Accept {
         packet: NtpPacket<'a>,
         decoded_cookie: Option<DecodedServerCookie>,
         recv_timestamp: NtpTimestamp,
     },
-    Ignore,
+    Ignore {
+        packet_version: Option<u8>,
+    },
     Deny {
         packet: NtpPacket<'a>,
         decoded_cookie: Option<DecodedServerCookie>,
@@ -132,6 +176,34 @@ enum AcceptResult<'a> {
     CryptoNak {
         packet: NtpPacket<'a>,
     },
+}
+
+struct RespondedAcceptResult<'a> {
+    stats: &'a ServerVersionStats,
+    result: AcceptResult<'a>,
+    response: Option<&'a [u8]>,
+}
+
+impl<'a> RespondedAcceptResult<'a> {
+    fn new(stats: &'a ServerVersionStats, result: AcceptResult<'a>, response: Option<&'a [u8]>) -> RespondedAcceptResult<'a> {
+        RespondedAcceptResult {
+            stats,
+            result,
+            response,
+        }
+    }
+
+    fn empty(stats: &'a ServerVersionStats, result: AcceptResult<'a>) -> RespondedAcceptResult<'a> {
+        RespondedAcceptResult::new(stats, result, None)
+    }
+
+    fn register(&self) {
+        self.stats.register(&self.result);
+    }
+
+    fn register_send_error(&self) {
+        self.stats.register_send_error(&self.result);
+    }
 }
 
 impl AcceptResult<'_> {
@@ -166,20 +238,39 @@ impl AcceptResult<'_> {
         }
     }
 
+    fn apply_ignore(self) -> Self {
+        AcceptResult::Ignore { packet_version: self.get_packet_version() }
+    }
+
+    fn get_packet_version(&self) -> Option<u8> {
+        match self {
+            AcceptResult::Accept { packet, .. } => Some(packet.version()),
+            AcceptResult::Ignore { packet_version: Some(pv) } => Some(*pv),
+            AcceptResult::Ignore { .. } => None,
+            AcceptResult::Invalid { packet_version: Some(pv) } => Some(*pv),
+            AcceptResult::Invalid { .. } => None,
+            AcceptResult::Deny { packet, .. } => Some(packet.version()),
+            AcceptResult::RateLimit { packet, .. } => Some(packet.version()),
+            AcceptResult::CryptoNak { packet } => Some(packet.version()),
+        }
+    }
+
     fn is_nts(&self) -> bool {
         match self {
             AcceptResult::Accept { decoded_cookie, .. }
             | AcceptResult::Deny { decoded_cookie, .. }
             | AcceptResult::RateLimit { decoded_cookie, .. } => decoded_cookie.is_some(),
             AcceptResult::CryptoNak { .. } => true,
-            AcceptResult::Ignore => false,
+            AcceptResult::Ignore { .. } => false,
+            AcceptResult::Invalid { .. } => false,
         }
     }
 
     fn kind_name(&self) -> &'static str {
         match self {
+            AcceptResult::Invalid { .. } => "Invalid",
             AcceptResult::Accept { .. } => "Accept",
-            AcceptResult::Ignore => "Ignore",
+            AcceptResult::Ignore { .. } => "Ignore",
             AcceptResult::Deny { .. } => "Deny",
             AcceptResult::RateLimit { .. } => "RateLimit",
             AcceptResult::CryptoNak { .. } => "CryptoNak",
@@ -203,7 +294,7 @@ enum FilterReason {
 impl<C: 'static + NtpClock + Send> ServerTask<C> {
     pub fn spawn(
         config: ServerConfig,
-        stats: ServerStats,
+        stats: ServerVersionStats,
         mut system_receiver: tokio::sync::watch::Receiver<SystemSnapshot>,
         keyset: tokio::sync::watch::Receiver<Arc<KeySet>>,
         clock: C,
@@ -313,10 +404,10 @@ impl<C: 'static + NtpClock + Send> ServerTask<C> {
     /// - check if the sender address matches any of the allow, deny, or rate-limit filters
     ///
     /// -> call [`Self::generate_response`] to further process the packet
-    async fn handle_receive(
-        &mut self,
+    async fn handle_receive<'buf>(
+        &'buf mut self,
         socket: &mut Socket<SocketAddr, Open>,
-        buf: &[u8],
+        buf: &'buf [u8],
         recv_res: std::io::Result<RecvResult<SocketAddr>>,
     ) -> SocketConnection {
         match recv_res {
@@ -334,7 +425,7 @@ impl<C: 'static + NtpClock + Send> ServerTask<C> {
                 match receive_error.raw_os_error() {
                     Some(libc::ENETDOWN) => SocketConnection::Reconnect,
                     _ => {
-                        self.stats.ignored_packets.inc();
+                        self.stats.unknown.ignored_packets.inc();
                         SocketConnection::KeepAlive
                     }
                 }
@@ -354,19 +445,27 @@ impl<C: 'static + NtpClock + Send> ServerTask<C> {
                 let mut response_buf = [0; MAX_PACKET_SIZE];
                 let response_buf = &mut response_buf[..length];
 
-                let Some(response) = self.handle_packet(
+                let resp = self.handle_packet(
                     request_buf,
                     response_buf,
                     peer_addr,
                     opt_timestamp.map(convert_net_timestamp),
-                ) else {
+                );
+
+                resp.register();
+
+                if let Some(response) = resp.response {
+                    if let Err(send_err) = socket.send_to(response, peer_addr).await {
+                        resp.register_send_error();
+                        debug!(error=?send_err, "Could not send response packet");
+                    }
+                }
+
+                 else {
                     return SocketConnection::KeepAlive;
                 };
 
-                if let Err(send_err) = socket.send_to(response, peer_addr).await {
-                    self.stats.response_send_errors.inc();
-                    debug!(error=?send_err, "Could not send response packet");
-                }
+
 
                 SocketConnection::KeepAlive
             }
@@ -375,16 +474,15 @@ impl<C: 'static + NtpClock + Send> ServerTask<C> {
 
     #[instrument(level = "debug", skip_all, fields(peer_addr, size = request_buf.len(), opt_timestamp))]
     fn handle_packet<'buf>(
-        &mut self,
-        request_buf: &[u8],
+        &'buf mut self,
+        request_buf: &'buf [u8],
         response_buf: &'buf mut [u8],
         peer_addr: SocketAddr,
         opt_timestamp: Option<NtpTimestamp>,
-    ) -> Option<&'buf [u8]> {
+    ) -> RespondedAcceptResult<'_> {
         let Some(timestamp) = opt_timestamp else {
             debug!("received a packet without a timestamp");
-            self.stats.update_from(&AcceptResult::Ignore);
-            return None;
+            return RespondedAcceptResult::empty(&self.stats, AcceptResult::Invalid { packet_version: None });
         };
 
         // Note: packets are allowed to be bigger when including extensions.
@@ -393,16 +491,14 @@ impl<C: 'static + NtpClock + Send> ServerTask<C> {
         // Messages of fewer than 48 bytes are skipped entirely
         if request_buf.len() < 48 {
             debug!("received packet is too small");
-            self.stats.update_from(&AcceptResult::Ignore);
-            return None;
+            return RespondedAcceptResult::empty(&self.stats, AcceptResult::Invalid { packet_version: None });
         }
 
         let filter_result =
             self.check_and_update_filters(peer_addr, self.config.rate_limiting_cutoff);
         if let Err(FilterReason::Ignore) = filter_result {
             debug!("filters decided to ignore");
-            self.stats.update_from(&AcceptResult::Ignore);
-            return None;
+            return RespondedAcceptResult::empty(&self.stats, AcceptResult::Ignore { packet_version: None });
         }
 
         // actually parse the packet. KeySet is cloned to not take a lock
@@ -412,29 +508,30 @@ impl<C: 'static + NtpClock + Send> ServerTask<C> {
         // apply filters
         let accept_result = match filter_result {
             Ok(_) => accept_result,
-            Err(FilterReason::Ignore) => AcceptResult::Ignore,
+            Err(FilterReason::Ignore) => accept_result.apply_ignore(),
             Err(FilterReason::Deny) => accept_result.apply_deny(),
             Err(FilterReason::RateLimit) => accept_result.apply_rate_limit(),
         };
 
-        // update statistics
-        self.stats.update_from(&accept_result);
         debug!(kind = accept_result.kind_name(), "Decided response");
 
-        let (packet, opt_cipher) = self.generate_response(accept_result)?;
-        let response_buf = Self::serialize_response(response_buf, packet, opt_cipher)?;
+        let response = self.generate_response(&accept_result).map(|(packet, opt_cipher)| {
+            Self::serialize_response(response_buf, packet, opt_cipher)
+        }).flatten();
 
-        debug!(response_size = response_buf.len(), "Generated response");
+        if let Some(res) = &response {
+            debug!(response_size = res.len(), "Generated response");
+        }
 
-        Some(response_buf)
+        RespondedAcceptResult::new(&self.stats, accept_result, response)
     }
 
     fn generate_response<'a>(
         &self,
-        accept_result: AcceptResult<'a>,
+        accept_result: &AcceptResult<'a>,
     ) -> Option<(NtpPacket<'a>, Option<Box<dyn Cipher>>)> {
         let (packet, cipher) = match accept_result {
-            AcceptResult::Ignore => {
+            AcceptResult::Invalid { .. } | AcceptResult::Ignore { .. } => {
                 return None;
             }
 
@@ -447,8 +544,8 @@ impl<C: 'static + NtpClock + Send> ServerTask<C> {
                     let keyset = self.keyset.borrow().clone();
                     let response = NtpPacket::nts_timestamp_response(
                         &self.system,
-                        packet,
-                        recv_timestamp,
+                        &packet,
+                        recv_timestamp.clone(),
                         &self.clock,
                         &cookie,
                         &keyset,
@@ -459,7 +556,7 @@ impl<C: 'static + NtpClock + Send> ServerTask<C> {
                     NtpPacket::timestamp_response(
                         &self.system,
                         packet,
-                        recv_timestamp,
+                        recv_timestamp.clone(),
                         &self.clock,
                     ),
                     None,
@@ -540,16 +637,20 @@ impl<C: 'static + NtpClock + Send> ServerTask<C> {
                 }
                 _ => {
                     trace!("NTP packet with unknown mode {:?} ignored", packet.mode());
-                    AcceptResult::Ignore
+                    AcceptResult::Ignore { packet_version: Some(packet.version()) }
                 }
             },
-            Err(PacketParsingError::DecryptError(packet)) => {
-                debug!("received packet with invalid nts cookie");
-                AcceptResult::CryptoNak { packet }
-            }
-            Err(e) => {
-                debug!("received invalid packet: {e}");
-                AcceptResult::Ignore
+            Err(ve) => {
+                match ve.error {
+                    PacketParsingError::DecryptError(packet) => {
+                        debug!("received packet with invalid nts cookie");
+                        AcceptResult::CryptoNak { packet }
+                    }
+                    e => {
+                        debug!("received invalid packet: {e}");
+                        AcceptResult::Invalid { packet_version: ve.version }
+                    }
+                }
             }
         }
     }
@@ -1193,7 +1294,7 @@ mod tests {
         let req = serialize_packet_unencryped(&req);
 
         // No timestamp
-        s.stats = ServerStats::default();
+        s.stats = ServerVersionStats::default();
         assert_eq!(
             s.handle_packet(
                 req.as_slice(),
@@ -1203,11 +1304,11 @@ mod tests {
             ),
             None
         );
-        assert_eq!(s.stats.ignored_packets.get(), 1);
-        assert_eq!(s.stats.received_packets.get(), 1);
+        assert_eq!(s.stats.unknown.ignored_packets.get(), 1);
+        assert_eq!(s.stats.unknown.received_packets.get(), 1);
 
         // Too short
-        s.stats = ServerStats::default();
+        s.stats = ServerVersionStats::default();
         assert!(s
             .handle_packet(
                 &[0; 23],
@@ -1216,8 +1317,8 @@ mod tests {
                 Some(NtpTimestamp::default()),
             )
             .is_none());
-        assert_eq!(s.stats.ignored_packets.get(), 1);
-        assert_eq!(s.stats.received_packets.get(), 1);
+        assert_eq!(s.stats.v4.ignored_packets.get(), 1);
+        assert_eq!(s.stats.v4.received_packets.get(), 1);
     }
 
     #[test]
@@ -1237,8 +1338,8 @@ mod tests {
                 Some(NtpTimestamp::default()),
             )
             .is_none());
-        assert_eq!(s.stats.ignored_packets.get(), 1);
-        assert_eq!(s.stats.received_packets.get(), 1);
+        assert_eq!(s.stats.unknown.ignored_packets.get(), 1);
+        assert_eq!(s.stats.unknown.received_packets.get(), 1);
     }
 }
 

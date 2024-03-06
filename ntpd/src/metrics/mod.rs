@@ -113,10 +113,29 @@ macro_rules! collect_sources {
 macro_rules! collect_servers {
     ($from: expr, |$ident: ident| $value: expr $(,)?) => {{
         let mut data = vec![];
-        for $ident in &$from.servers {
-            let labels = vec![("listen_address", format!("{}", $ident.address))];
+        for tmp in &$from.servers {
+            let $ident = &tmp.stats.v3;
+            let labels = vec![("listen_address", format!("{}", tmp.address)), ("version", "v3".into())];
             let value = $value;
-            data.push(Measurement { labels, value })
+            data.push(Measurement { labels, value });
+
+            let $ident = &tmp.stats.v4;
+            let labels = vec![("listen_address", format!("{}", tmp.address)), ("version", "v4".into())];
+            let value = $value;
+            data.push(Measurement { labels, value });
+
+            #[cfg(feature = "unstable_ntpv5")]
+            {
+                let $ident = &tmp.stats.v5;
+                let labels = vec![("listen_address", format!("{}", tmp.address)), ("version", "v5".into())];
+                let value = $value;
+                data.push(Measurement { labels, value });
+            }
+
+            let $ident = &tmp.stats.unknown;
+            let labels = vec![("listen_address", format!("{}", tmp.address)), ("version", "unknown".into())];
+            let value = $value;
+            data.push(Measurement { labels, value });
         }
         data
     }};
@@ -281,7 +300,7 @@ pub fn format_state(w: &mut impl std::fmt::Write, state: &ObservableState) -> st
         "Number of incoming packets",
         MetricType::Counter,
         None,
-        collect_servers!(state, |s| s.stats.received_packets.get()),
+        collect_servers!(state, |s| s.received_packets.get()),
     )?;
 
     format_metric(
@@ -290,7 +309,7 @@ pub fn format_state(w: &mut impl std::fmt::Write, state: &ObservableState) -> st
         "Number of packets accepted",
         MetricType::Counter,
         None,
-        collect_servers!(state, |s| s.stats.accepted_packets.get()),
+        collect_servers!(state, |s| s.accepted_packets.get()),
     )?;
 
     format_metric(
@@ -299,7 +318,7 @@ pub fn format_state(w: &mut impl std::fmt::Write, state: &ObservableState) -> st
         "Number of denied packets",
         MetricType::Counter,
         None,
-        collect_servers!(state, |s| s.stats.denied_packets.get()),
+        collect_servers!(state, |s| s.denied_packets.get()),
     )?;
 
     format_metric(
@@ -308,7 +327,7 @@ pub fn format_state(w: &mut impl std::fmt::Write, state: &ObservableState) -> st
         "Number of packets ignored",
         MetricType::Counter,
         None,
-        collect_servers!(state, |s| s.stats.ignored_packets.get()),
+        collect_servers!(state, |s| s.ignored_packets.get()),
     )?;
 
     format_metric(
@@ -317,7 +336,7 @@ pub fn format_state(w: &mut impl std::fmt::Write, state: &ObservableState) -> st
         "Number of rate limited packets",
         MetricType::Counter,
         None,
-        collect_servers!(state, |s| s.stats.rate_limited_packets.get()),
+        collect_servers!(state, |s| s.rate_limited_packets.get()),
     )?;
 
     format_metric(
@@ -326,7 +345,7 @@ pub fn format_state(w: &mut impl std::fmt::Write, state: &ObservableState) -> st
         "Number of packets where there was an error responding",
         MetricType::Counter,
         None,
-        collect_servers!(state, |s| s.stats.response_send_errors.get()),
+        collect_servers!(state, |s| s.response_send_errors.get()),
     )?;
 
     format_metric(
@@ -335,7 +354,7 @@ pub fn format_state(w: &mut impl std::fmt::Write, state: &ObservableState) -> st
         "Number of incoming NTS packets",
         MetricType::Counter,
         None,
-        collect_servers!(state, |s| s.stats.nts_received_packets.get()),
+        collect_servers!(state, |s| s.nts_received_packets.get()),
     )?;
 
     format_metric(
@@ -344,7 +363,7 @@ pub fn format_state(w: &mut impl std::fmt::Write, state: &ObservableState) -> st
         "Number of NTS packets accepted",
         MetricType::Counter,
         None,
-        collect_servers!(state, |s| s.stats.nts_accepted_packets.get()),
+        collect_servers!(state, |s| s.nts_accepted_packets.get()),
     )?;
 
     format_metric(
@@ -353,7 +372,7 @@ pub fn format_state(w: &mut impl std::fmt::Write, state: &ObservableState) -> st
         "Number of denied NTS packets",
         MetricType::Counter,
         None,
-        collect_servers!(state, |s| s.stats.nts_denied_packets.get()),
+        collect_servers!(state, |s| s.nts_denied_packets.get()),
     )?;
 
     format_metric(
@@ -362,7 +381,7 @@ pub fn format_state(w: &mut impl std::fmt::Write, state: &ObservableState) -> st
         "Number of rate limited NTS packets",
         MetricType::Counter,
         None,
-        collect_servers!(state, |s| s.stats.nts_rate_limited_packets.get()),
+        collect_servers!(state, |s| s.nts_rate_limited_packets.get()),
     )?;
 
     format_metric(
@@ -371,7 +390,7 @@ pub fn format_state(w: &mut impl std::fmt::Write, state: &ObservableState) -> st
         "Number of NTS nak responses to packets",
         MetricType::Counter,
         None,
-        collect_servers!(state, |s| s.stats.nts_nak_packets.get()),
+        collect_servers!(state, |s| s.nts_nak_packets.get()),
     )?;
 
     w.write_str("# EOF\n")?;
